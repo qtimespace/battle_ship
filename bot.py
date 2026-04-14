@@ -12,6 +12,10 @@ dp = Dispatcher(bot)
 FIELD = 10
 LETTERS = "ABCDEFGHIJ"
 FLEET = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1]
+CELL_UNKNOWN = "."
+CELL_SHIP = "#"
+CELL_HIT = "X"
+CELL_MISS = "o"
 
 # code -> game dict
 games = {}
@@ -94,10 +98,12 @@ def render(player, show_ships):
     show_ships=True: own field (ships + incoming shots).
     show_ships=False: enemy field (your outgoing shots only).
     """
-    header = "   " + " ".join(LETTERS)
-    rows = [header]
+    # ASCII table keeps Telegram <pre> alignment predictable.
+    header = "    " + "   ".join(LETTERS)
+    separator = "   +" + "---+" * FIELD
+    rows = [header, separator]
     for y in range(FIELD):
-        row = [f"{y + 1:>2} "]
+        row = [f"{y + 1:>2} |"]
         for x in range(FIELD):
             cell = (x, y)
             if show_ships:
@@ -105,21 +111,22 @@ def render(player, show_ships):
                 hit = cell in player["incoming_hits"]
                 miss = cell in player["incoming_misses"]
                 if hit:
-                    row.append("🔥")
+                    row.append(f" {CELL_HIT} |")
                 elif miss:
-                    row.append("·")
+                    row.append(f" {CELL_MISS} |")
                 elif in_ship:
-                    row.append("■")
+                    row.append(f" {CELL_SHIP} |")
                 else:
-                    row.append("▫")
+                    row.append(f" {CELL_UNKNOWN} |")
             else:
                 if cell in player["shots_hit"]:
-                    row.append("🔥")
+                    row.append(f" {CELL_HIT} |")
                 elif cell in player["shots_miss"]:
-                    row.append("·")
+                    row.append(f" {CELL_MISS} |")
                 else:
-                    row.append("▫")
-        rows.append(" ".join(row))
+                    row.append(f" {CELL_UNKNOWN} |")
+        rows.append("".join(row))
+        rows.append(separator)
     return "<pre>" + "\n".join(rows) + "</pre>"
 
 
