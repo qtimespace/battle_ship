@@ -90,37 +90,40 @@ def parse_move(text):
 
 
 def render(player, show_ships):
-    """Render a 10x10 field for a given player view.
-    show_ships=True: own field (ships + incoming shots).
-    show_ships=False: enemy field (your outgoing shots only).
+    """Grid field like squared paper.
+    Ship cell: hatched '▒▒▒'. Hit: ' X '. Miss: ' · '. Empty: '   '.
     """
-    header = "   " + " ".join(LETTERS)
-    rows = [header]
+    col_header = "     " + "   ".join(LETTERS)
+    top_line = "   ┌" + "┬".join(["───"] * FIELD) + "┐"
+    sep_line = "   ├" + "┼".join(["───"] * FIELD) + "┤"
+    bot_line = "   └" + "┴".join(["───"] * FIELD) + "┘"
+
+    lines = [col_header, top_line]
     for y in range(FIELD):
-        row = [f"{y + 1:>2} "]
+        cells = []
         for x in range(FIELD):
             cell = (x, y)
             if show_ships:
-                in_ship = any(cell in s for s in player["ships_cells"])
-                hit = cell in player["incoming_hits"]
-                miss = cell in player["incoming_misses"]
-                if hit:
-                    row.append("🔥")
-                elif miss:
-                    row.append("·")
-                elif in_ship:
-                    row.append("■")
+                if cell in player["incoming_hits"]:
+                    cells.append(" X ")
+                elif cell in player["incoming_misses"]:
+                    cells.append(" · ")
+                elif any(cell in s for s in player["ships_cells"]):
+                    cells.append("▒▒▒")
                 else:
-                    row.append("▫")
+                    cells.append("   ")
             else:
                 if cell in player["shots_hit"]:
-                    row.append("🔥")
+                    cells.append(" X ")
                 elif cell in player["shots_miss"]:
-                    row.append("·")
+                    cells.append(" · ")
                 else:
-                    row.append("▫")
-        rows.append(" ".join(row))
-    return "<pre>" + "\n".join(rows) + "</pre>"
+                    cells.append("   ")
+        lines.append(f"{y + 1:>2} │" + "│".join(cells) + "│")
+        if y < FIELD - 1:
+            lines.append(sep_line)
+    lines.append(bot_line)
+    return "<pre>" + "\n".join(lines) + "</pre>"
 
 
 def new_player():
@@ -143,14 +146,17 @@ def reroll(player):
 
 async def send_boards(game, user_id, prefix=""):
     p = game["players"][user_id]
-    opp_id = other(game, user_id)
     own = render(p, show_ships=True)
-    enemy = render(p, show_ships=False)
-    text = (
-        f"{prefix}\n"
-        f"🎯 Поле противника (твои выстрелы):\n{enemy}\n"
-        f"🚢 Твоё поле:\n{own}"
-    )
+    has_opponent = len(game["players"]) >= 2
+    if has_opponent and game["state"] == "PLAYING":
+        enemy = render(p, show_ships=False)
+        text = (
+            f"{prefix}\n"
+            f"🎯 Поле противника (твои выстрелы):\n{enemy}\n"
+            f"🚢 Твоё поле:\n{own}"
+        )
+    else:
+        text = f"{prefix}\n🚢 Твоё поле:\n{own}"
     await bot.send_message(user_id, text, parse_mode="HTML")
 
 
