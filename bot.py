@@ -1,9 +1,10 @@
+import os
 import random
 import string
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 
-API_TOKEN = "YOUR_BOT_TOKEN_HERE"
+API_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
