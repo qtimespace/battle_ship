@@ -44,6 +44,10 @@ TURN_TIMEOUT_SEC = 600  # 10 минут на ход; иначе автопора
 # code -> asyncio.Task
 _turn_timers: dict = {}
 
+# Пауза перед стартом polling, чтобы Telegram освободил предыдущий
+# getUpdates после редеплоя на Railway (иначе TerminatedByOtherGetUpdates).
+STARTUP_DELAY_SEC = int(os.getenv("STARTUP_DELAY_SEC", "15"))
+
 
 def join_allowed(user_id):
     import time
@@ -628,6 +632,13 @@ async def on_startup(dispatcher):
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     log.info("db pool created")
     await load_state()
+    if STARTUP_DELAY_SEC > 0:
+        log.info("startup delay %ss to release previous getUpdates session", STARTUP_DELAY_SEC)
+        await asyncio.sleep(STARTUP_DELAY_SEC)
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        log.exception("delete_webhook failed (non-fatal)")
 
 
 async def on_shutdown(dispatcher):
