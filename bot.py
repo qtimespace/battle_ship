@@ -1,10 +1,31 @@
+import asyncio
+import json
+import logging
 import os
 import random
+import re
 import string
+import asyncpg
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 
-API_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("battleship")
+
+API_TOKEN = os.getenv("BOT_TOKEN")
+if not API_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN env var is not set. Получи токен у @BotFather и задай переменную окружения."
+    )
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL env var is not set.")
+
+db_pool: asyncpg.Pool = None  # type: ignore
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
@@ -12,6 +33,7 @@ dp = Dispatcher(bot)
 FIELD = 10
 LETTERS = "ABCDEFGHIJ"
 FLEET = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1]
+CODE_RE = re.compile(r"^[A-Z0-9]{6}$")
 
 # code -> game dict
 games = {}
@@ -24,6 +46,105 @@ def new_code():
         code = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
         if code not in games:
             return code
+
+
+# ---------- Persistence ----------
+
+def _cells_to_list(cells):
+    return [list(c) for c in cells]
+
+
+def _cells_to_set(raw):
+    return {tuple(c) for c in raw}
+
+
+def serialize_game(game):
+    players = {}
+    for uid, p in game["players"].items():
+        players[str(uid)] = {
+            "ready": p["ready"],
+            "ships": [
+                {"orig": _cells_to_list(s["orig"]), "alive": _cells_to_list(s["alive"])}
+                for s in p["ships"]
+            ],
+            "incoming_hits": _cells_to_list(p["incoming_hits"]),
+            "incoming_misses": _cells_to_list(p["incoming_misses"]),
+            "shots_hit": _cells_to_list(p["shots_hit"]),
+            "shots_miss": _cells_to_list(p["shots_miss"]),
+        }
+    return {"players": players}
+
+
+def deserialize_game(row):
+    data = row["data"]
+    if isinstance(data, str):
+        data = json.loads(data)
+    players = {}
+    for uid_s, p in data["players"].items():
+        ships = [
+            {"orig": _cells_to_set(s["orig"]), "alive": _cells_to_set(s["alive"])}
+            for s in p["ships"]
+        ]
+        players[int(uid_s)] = {
+            "ready": p["ready"],
+            "ships": ships,
+            "ships_cells": [s["orig"] for s in ships],
+            "incoming_hits": _cells_to_set(p["incoming_hits"]),
+            "incoming_misses": _cells_to_set(p["incoming_misses"]),
+            "shots_hit": _cells_to_set(p["shots_hit"]),
+            "shots_miss": _cells_to_set(p["shots_miss"]),
+        }
+    return {
+        "code": row["code"],
+        "state": row["state"],
+        "turn": row["turn"],
+        "host": row["host"],
+        "players": players,
+    }
+
+
+async def save_game(code):
+    game = games.get(code)
+    if not game:
+        return
+    payload = json.dumps(serialize_game(game))
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO games (code, state, turn, host, data, updated_at)
+                VALUES ($1, $2, $3, $4, $5::jsonb, NOW())
+                ON CONFLICT (code) DO UPDATE SET
+                    state=EXCLUDED.state,
+                    turn=EXCLUDED.turn,
+                    data=EXCLUDED.data,
+                    updated_at=NOW()
+                """,
+                code, game["state"], game["turn"], game["host"], payload,
+            )
+            await conn.execute("DELETE FROM user_game WHERE code=$1", code)
+            if game["players"]:
+                await conn.executemany(
+                    "INSERT INTO user_game (user_id, code) VALUES ($1, $2) "
+                    "ON CONFLICT (user_id) DO UPDATE SET code=EXCLUDED.code",
+                    [(uid, code) for uid in game["players"].keys()],
+                )
+
+
+async def delete_game(code):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM games WHERE code=$1", code)
+
+
+async def load_state():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT code, state, turn, host, data FROM games")
+    for r in rows:
+        g = deserialize_game(r)
+        games[g["code"]] = g
+        for uid in g["players"].keys():
+            user_game[uid] = g["code"]
+    log.info("restored %d games, %d user mappings", len(games), len(user_game))
 
 
 def neighbors(cell):
@@ -161,7 +282,21 @@ async def send_boards(game, user_id, prefix=""):
 
 
 def other(game, user_id):
-    return [u for u in game["players"] if u != user_id][0]
+    rest = [u for u in game["players"] if u != user_id]
+    if len(rest) != 1:
+        raise RuntimeError(f"other(): expected 2 players, got {len(game['players'])}")
+    return rest[0]
+
+
+def safe_reroll(player):
+    """Reroll with fallback; raises only after multiple attempts."""
+    for _ in range(3):
+        try:
+            reroll(player)
+            return
+        except RuntimeError:
+            log.warning("place_fleet failed, retrying")
+    raise RuntimeError("Не удалось сгенерировать расстановку.")
 
 
 @dp.message_handler(commands=["start", "help"])
@@ -193,9 +328,16 @@ async def cmd_new(message: types.Message):
         "host": uid,
     }
     game["players"][uid] = new_player()
-    reroll(game["players"][uid])
+    try:
+        safe_reroll(game["players"][uid])
+    except RuntimeError as e:
+        log.exception("new: reroll failed")
+        await message.reply(str(e))
+        return
     games[code] = game
     user_game[uid] = code
+    await save_game(code)
+    log.info("game created code=%s host=%s", code, uid)
     await message.reply(
         f"🎲 Игра создана. Код: <code>{code}</code>\n"
         f"Отправь его сопернику — пусть напишет <code>/join {code}</code>\n\n"
@@ -216,17 +358,29 @@ async def cmd_join(message: types.Message):
         await message.reply("Формат: /join КОД")
         return
     code = parts[1].strip().upper()
+    if not CODE_RE.match(code):
+        await message.reply("Код должен состоять из 6 символов A–Z или 0–9.")
+        return
     game = games.get(code)
     if not game:
         await message.reply("Игра с таким кодом не найдена.")
         return
-    if game["state"] != "WAITING":
+    if game["state"] != "WAITING" or len(game["players"]) >= 2:
         await message.reply("Игра уже идёт или завершена.")
         return
+    game["state"] = "PLACING"  # занимаем слот до await, чтобы закрыть race-окно
     game["players"][uid] = new_player()
-    reroll(game["players"][uid])
+    try:
+        safe_reroll(game["players"][uid])
+    except RuntimeError as e:
+        log.exception("join: reroll failed")
+        game["players"].pop(uid, None)
+        game["state"] = "WAITING"
+        await message.reply(str(e))
+        return
     user_game[uid] = code
-    game["state"] = "PLACING"
+    await save_game(code)
+    log.info("player %s joined code=%s", uid, code)
     await message.reply(
         "✅ Присоединился. /replace — перекинуть расстановку, /ready — готов к бою."
     )
@@ -249,7 +403,12 @@ async def cmd_replace(message: types.Message):
     if p["ready"]:
         await message.reply("Ты уже нажал /ready.")
         return
-    reroll(p)
+    try:
+        safe_reroll(p)
+    except RuntimeError as e:
+        await message.reply(str(e))
+        return
+    await save_game(code)
     await send_boards(game, uid, "Новая расстановка:")
 
 
@@ -261,21 +420,28 @@ async def cmd_ready(message: types.Message):
         await message.reply("Ты не в игре.")
         return
     game = games[code]
+    if game["state"] not in ("WAITING", "PLACING"):
+        await message.reply("Бой уже идёт.")
+        return
     if len(game["players"]) < 2:
         await message.reply("Ждём второго игрока.")
+        return
+    if game["players"][uid]["ready"]:
+        await message.reply("Ты уже готов, ждём соперника.")
         return
     game["players"][uid]["ready"] = True
     await message.reply("✔ Готов.")
     opp = other(game, uid)
     if game["players"][opp]["ready"]:
-        # start
         game["state"] = "PLAYING"
         game["turn"] = random.choice(list(game["players"].keys()))
         first = game["turn"]
         second = other(game, first)
+        await save_game(code)
         await bot.send_message(first, "🔫 Твой ход. Координата, например B7")
         await bot.send_message(second, "⏳ Ход соперника.")
     else:
+        await save_game(code)
         await bot.send_message(opp, "Соперник готов. Жми /ready когда расставишь корабли.")
 
 
@@ -287,6 +453,7 @@ async def cmd_surrender(message: types.Message):
         await message.reply("Ты не в игре.")
         return
     game = games[code]
+    log.info("surrender uid=%s code=%s", uid, code)
     await message.reply("🏳 Ты сдался.")
     for pid in list(game["players"].keys()):
         user_game.pop(pid, None)
@@ -296,6 +463,7 @@ async def cmd_surrender(message: types.Message):
             except Exception:
                 pass
     games.pop(code, None)
+    await delete_game(code)
 
 
 @dp.message_handler()
@@ -334,6 +502,7 @@ async def handle_move(message: types.Message):
         shooter["shots_miss"].add(move)
         opp["incoming_misses"].add(move)
         game["turn"] = opp_id
+        await save_game(code)
         await send_boards(game, uid, f"🌊 Мимо ({coord_name}). Ход соперника.")
         await send_boards(game, opp_id, f"Соперник стрелял {coord_name} — мимо. Твой ход.")
         return
@@ -343,6 +512,7 @@ async def handle_move(message: types.Message):
     opp["incoming_hits"].add(move)
 
     if hit_ship["alive"]:
+        await save_game(code)
         await send_boards(game, uid, f"🎯 Ранил ({coord_name})! Стреляй ещё.")
         await send_boards(game, opp_id, f"Соперник ранил ({coord_name}). Ждём его хода.")
         return
@@ -356,15 +526,35 @@ async def handle_move(message: types.Message):
 
     if all(not s["alive"] for s in opp["ships"]):
         await send_boards(game, uid, f"💥 Убил ({coord_name})!\n🏆 ПОБЕДА!")
-        await send_boards(game, opp_id, f"Соперник убил {coord_name}.\n💀 Поражение.")
+        await send_boards(game, opp_id, f"Соперник убил корабль {coord_name}.\n💀 Поражение.")
+        log.info("game %s finished, winner=%s", code, uid)
         for pid in list(game["players"].keys()):
             user_game.pop(pid, None)
         games.pop(code, None)
+        await delete_game(code)
         return
 
+    await save_game(code)
     await send_boards(game, uid, f"💥 Убил ({coord_name})! Стреляй ещё.")
     await send_boards(game, opp_id, f"Соперник убил корабль ({coord_name}). Ждём его хода.")
 
 
+async def on_startup(dispatcher):
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    log.info("db pool created")
+    await load_state()
+
+
+async def on_shutdown(dispatcher):
+    if db_pool:
+        await db_pool.close()
+
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    executor.start_polling(
+        dp,
+        skip_updates=True,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+    )
