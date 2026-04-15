@@ -35,6 +35,26 @@ LETTERS = "ABCDEFGHIJ"
 FLEET = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1]
 CODE_RE = re.compile(r"^[A-Z0-9]{6}$")
 
+JOIN_WINDOW_SEC = 60
+JOIN_MAX_ATTEMPTS = 5
+# user_id -> list of recent attempt timestamps
+_join_attempts: dict = {}
+
+TURN_TIMEOUT_SEC = 600  # 10 минут на ход; иначе автопоражение
+# code -> asyncio.Task
+_turn_timers: dict = {}
+
+
+def join_allowed(user_id):
+    import time
+    now = time.monotonic()
+    buf = _join_attempts.setdefault(user_id, [])
+    buf[:] = [t for t in buf if now - t < JOIN_WINDOW_SEC]
+    if len(buf) >= JOIN_MAX_ATTEMPTS:
+        return False
+    buf.append(now)
+    return True
+
 # code -> game dict
 games = {}
 # user_id -> code
@@ -136,6 +156,52 @@ async def delete_game(code):
         await conn.execute("DELETE FROM games WHERE code=$1", code)
 
 
+def cancel_turn_timer(code):
+    t = _turn_timers.pop(code, None)
+    if t and not t.done():
+        t.cancel()
+
+
+async def _turn_timeout_handler(code, expected_turn):
+    try:
+        await asyncio.sleep(TURN_TIMEOUT_SEC)
+    except asyncio.CancelledError:
+        return
+    game = games.get(code)
+    if not game or game["state"] != "PLAYING" or game["turn"] != expected_turn:
+        return
+    loser = expected_turn
+    try:
+        winner = other(game, loser)
+    except RuntimeError:
+        return
+    log.info("turn timeout code=%s loser=%s winner=%s", code, loser, winner)
+    for pid in list(game["players"].keys()):
+        user_game.pop(pid, None)
+    games.pop(code, None)
+    _turn_timers.pop(code, None)
+    try:
+        await delete_game(code)
+    except Exception:
+        log.exception("delete_game on timeout failed")
+    for pid, text in ((loser, "⌛ Время хода вышло. 💀 Поражение."),
+                      (winner, "⌛ Соперник не сделал ход вовремя. 🏆 Победа!")):
+        try:
+            await bot.send_message(pid, text)
+        except Exception:
+            pass
+
+
+def schedule_turn_timer(code):
+    cancel_turn_timer(code)
+    game = games.get(code)
+    if not game or game["state"] != "PLAYING" or game["turn"] is None:
+        return
+    _turn_timers[code] = asyncio.create_task(
+        _turn_timeout_handler(code, game["turn"])
+    )
+
+
 async def load_state():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT code, state, turn, host, data FROM games")
@@ -145,6 +211,9 @@ async def load_state():
         for uid in g["players"].keys():
             user_game[uid] = g["code"]
     log.info("restored %d games, %d user mappings", len(games), len(user_game))
+    for code, g in games.items():
+        if g["state"] == "PLAYING" and g["turn"]:
+            schedule_turn_timer(code)
 
 
 def neighbors(cell):
@@ -361,6 +430,12 @@ async def cmd_join(message: types.Message):
     if not CODE_RE.match(code):
         await message.reply("Код должен состоять из 6 символов A–Z или 0–9.")
         return
+    if not join_allowed(uid):
+        await message.reply(
+            f"Слишком много попыток. Подожди минуту (лимит {JOIN_MAX_ATTEMPTS}/мин)."
+        )
+        log.warning("join rate-limit uid=%s", uid)
+        return
     game = games.get(code)
     if not game:
         await message.reply("Игра с таким кодом не найдена.")
@@ -438,7 +513,8 @@ async def cmd_ready(message: types.Message):
         first = game["turn"]
         second = other(game, first)
         await save_game(code)
-        await bot.send_message(first, "🔫 Твой ход. Координата, например B7")
+        schedule_turn_timer(code)
+        await bot.send_message(first, f"🔫 Твой ход. Координата, например B7. На ход — {TURN_TIMEOUT_SEC // 60} мин.")
         await bot.send_message(second, "⏳ Ход соперника.")
     else:
         await save_game(code)
@@ -454,6 +530,7 @@ async def cmd_surrender(message: types.Message):
         return
     game = games[code]
     log.info("surrender uid=%s code=%s", uid, code)
+    cancel_turn_timer(code)
     await message.reply("🏳 Ты сдался.")
     for pid in list(game["players"].keys()):
         user_game.pop(pid, None)
@@ -486,6 +563,9 @@ async def handle_move(message: types.Message):
     if move in shooter["shots_hit"] or move in shooter["shots_miss"]:
         await message.reply("Ты уже стрелял сюда.")
         return
+    if any(move in s["orig"] for s in shooter["ships"]):
+        await message.reply("Это твоя клетка, стреляй по полю соперника.")
+        return
 
     opp_id = other(game, uid)
     opp = game["players"][opp_id]
@@ -503,6 +583,7 @@ async def handle_move(message: types.Message):
         opp["incoming_misses"].add(move)
         game["turn"] = opp_id
         await save_game(code)
+        schedule_turn_timer(code)
         await send_boards(game, uid, f"🌊 Мимо ({coord_name}). Ход соперника.")
         await send_boards(game, opp_id, f"Соперник стрелял {coord_name} — мимо. Твой ход.")
         return
@@ -513,6 +594,7 @@ async def handle_move(message: types.Message):
 
     if hit_ship["alive"]:
         await save_game(code)
+        schedule_turn_timer(code)
         await send_boards(game, uid, f"🎯 Ранил ({coord_name})! Стреляй ещё.")
         await send_boards(game, opp_id, f"Соперник ранил ({coord_name}). Ждём его хода.")
         return
@@ -528,6 +610,7 @@ async def handle_move(message: types.Message):
         await send_boards(game, uid, f"💥 Убил ({coord_name})!\n🏆 ПОБЕДА!")
         await send_boards(game, opp_id, f"Соперник убил корабль {coord_name}.\n💀 Поражение.")
         log.info("game %s finished, winner=%s", code, uid)
+        cancel_turn_timer(code)
         for pid in list(game["players"].keys()):
             user_game.pop(pid, None)
         games.pop(code, None)
@@ -535,6 +618,7 @@ async def handle_move(message: types.Message):
         return
 
     await save_game(code)
+    schedule_turn_timer(code)
     await send_boards(game, uid, f"💥 Убил ({coord_name})! Стреляй ещё.")
     await send_boards(game, opp_id, f"Соперник убил корабль ({coord_name}). Ждём его хода.")
 
