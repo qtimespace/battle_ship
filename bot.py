@@ -14,8 +14,8 @@ LETTERS = "ABCDEFGHIJ"
 FLEET = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1]
 CELL_UNKNOWN = "."
 CELL_SHIP = "#"
-CELL_HIT = "X"
-CELL_MISS = "o"
+CELL_HIT = "🔥"
+CELL_MISS = "🔴"
 
 # code -> game dict
 games = {}
@@ -99,7 +99,7 @@ def render(player, show_ships):
     show_ships=False: enemy field (your outgoing shots only).
     """
     # ASCII table keeps Telegram <pre> alignment predictable.
-    header = "    " + "   ".join(LETTERS)
+    header = "   |" + "|".join(f" {letter} " for letter in LETTERS) + "|"
     separator = "   +" + "---+" * FIELD
     rows = [header, separator]
     for y in range(FIELD):
