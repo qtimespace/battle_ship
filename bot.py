@@ -5,6 +5,7 @@ import os
 import random
 import re
 import string
+from urllib.parse import quote
 import asyncpg
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
@@ -34,6 +35,44 @@ FIELD = 10
 LETTERS = "ABCDEFGHIJ"
 FLEET = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1]
 CODE_RE = re.compile(r"^[A-Z0-9]{6}$")
+
+# username бота, узнаётся в on_startup; нужен для deep-link приглашений
+BOT_USERNAME = None
+
+
+def kb_menu(state=None):
+    """Контекстная reply-клавиатура с командами."""
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    if state == "PLACING":
+        kb.row(types.KeyboardButton("/replace"), types.KeyboardButton("/ready"))
+        kb.row(types.KeyboardButton("/surrender"))
+    elif state == "PLAYING":
+        kb.row(types.KeyboardButton("/surrender"))
+        kb.row(types.KeyboardButton("/help"))
+    else:
+        kb.row(types.KeyboardButton("/new"))
+        kb.row(types.KeyboardButton("/help"))
+    return kb
+
+
+def kb_invite(code):
+    """Inline-кнопка с share-sheet Telegram и deep-link'ом в игру."""
+    deep = f"https://t.me/{BOT_USERNAME}?start={code}"
+    text = f"Зову тебя в морской бой! Жми, чтобы войти: {deep}"
+    share = (
+        "https://t.me/share/url?"
+        f"url={quote(deep, safe='')}&text={quote(text, safe='')}"
+    )
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(types.InlineKeyboardButton("📨 Позвать друга", url=share))
+    return m
+
+
+def _user_state(uid):
+    code = user_game.get(uid)
+    if not code or code not in games:
+        return None
+    return games[code]["state"]
 
 JOIN_WINDOW_SEC = 60
 JOIN_MAX_ATTEMPTS = 5
@@ -191,7 +230,7 @@ async def _turn_timeout_handler(code, expected_turn):
     for pid, text in ((loser, "⌛ Время хода вышло. 💀 Поражение."),
                       (winner, "⌛ Соперник не сделал ход вовремя. 🏆 Победа!")):
         try:
-            await bot.send_message(pid, text)
+            await bot.send_message(pid, text, reply_markup=kb_menu())
         except Exception:
             pass
 
@@ -284,39 +323,33 @@ def parse_move(text):
 
 
 def render(player, show_ships):
-    """Grid field like squared paper.
-    Ship cell: hatched '▒▒▒'. Hit: ' X '. Miss: ' · '. Empty: '   '.
+    """Однобайтный grid: каждая клетка — 1 ASCII-символ, разделитель — пробел.
+    Рамки и штриховка убраны: в мобильных моно-шрифтах Telegram они плывут.
     """
-    col_header = "     " + "   ".join(LETTERS)
-    top_line = "   ┌" + "┬".join(["───"] * FIELD) + "┐"
-    sep_line = "   ├" + "┼".join(["───"] * FIELD) + "┤"
-    bot_line = "   └" + "┴".join(["───"] * FIELD) + "┘"
-
-    lines = [col_header, top_line]
+    EMPTY, SHIP, HIT, MISS = ".", "#", "X", "o"
+    header = "   " + " ".join(LETTERS)
+    lines = [header]
     for y in range(FIELD):
-        cells = []
+        row = []
         for x in range(FIELD):
             cell = (x, y)
             if show_ships:
                 if cell in player["incoming_hits"]:
-                    cells.append(" X ")
+                    row.append(HIT)
                 elif cell in player["incoming_misses"]:
-                    cells.append(" · ")
+                    row.append(MISS)
                 elif any(cell in s for s in player["ships_cells"]):
-                    cells.append("▒▒▒")
+                    row.append(SHIP)
                 else:
-                    cells.append("   ")
+                    row.append(EMPTY)
             else:
                 if cell in player["shots_hit"]:
-                    cells.append(" X ")
+                    row.append(HIT)
                 elif cell in player["shots_miss"]:
-                    cells.append(" · ")
+                    row.append(MISS)
                 else:
-                    cells.append("   ")
-        lines.append(f"{y + 1:>2} │" + "│".join(cells) + "│")
-        if y < FIELD - 1:
-            lines.append(sep_line)
-    lines.append(bot_line)
+                    row.append(EMPTY)
+        lines.append(f"{y + 1:>2} " + " ".join(row))
     return "<pre>" + "\n".join(lines) + "</pre>"
 
 
@@ -338,7 +371,7 @@ def reroll(player):
     player["ships_cells"] = [s["orig"] for s in player["ships"]]
 
 
-async def send_boards(game, user_id, prefix=""):
+async def send_boards(game, user_id, prefix="", reply_markup=None):
     p = game["players"][user_id]
     own = render(p, show_ships=True)
     has_opponent = len(game["players"]) >= 2
@@ -351,7 +384,9 @@ async def send_boards(game, user_id, prefix=""):
         )
     else:
         text = f"{prefix}\n🚢 Твоё поле:\n{own}"
-    await bot.send_message(user_id, text, parse_mode="HTML")
+    await bot.send_message(
+        user_id, text, parse_mode="HTML", reply_markup=reply_markup
+    )
 
 
 def other(game, user_id):
@@ -372,25 +407,49 @@ def safe_reroll(player):
     raise RuntimeError("Не удалось сгенерировать расстановку.")
 
 
-@dp.message_handler(commands=["start", "help"])
-async def cmd_start(message: types.Message):
+HELP_TEXT = (
+    "🚢 <b>Морской бой</b>\n\n"
+    "/new — создать игру и позвать друга\n"
+    "/join КОД — присоединиться по коду вручную\n"
+    "/replace — перекинуть расстановку\n"
+    "/ready — готов к бою\n"
+    "/surrender — сдаться\n\n"
+    "Ход вводится координатой: <code>A1</code>, <code>B7</code>, <code>J10</code>\n"
+    "Обозначения: <code>#</code> — твой корабль, <code>X</code> — попадание, "
+    "<code>o</code> — промах, <code>.</code> — пусто."
+)
+
+
+async def _send_help(message):
     await message.reply(
-        "🚢 <b>Морской бой</b>\n\n"
-        "/new — создать игру (получишь код)\n"
-        "/join КОД — присоединиться по коду\n"
-        "/replace — перекинуть расстановку\n"
-        "/ready — готов к бою\n"
-        "/surrender — сдаться\n\n"
-        "Ход вводится координатой: <code>A1</code>, <code>B7</code>, <code>J10</code>",
+        HELP_TEXT,
         parse_mode="HTML",
+        reply_markup=kb_menu(_user_state(message.from_user.id)),
     )
+
+
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    arg = (message.get_args() or "").strip().upper()
+    if arg and CODE_RE.match(arg):
+        await _try_join(message, arg)
+        return
+    await _send_help(message)
+
+
+@dp.message_handler(commands=["help"])
+async def cmd_help(message: types.Message):
+    await _send_help(message)
 
 
 @dp.message_handler(commands=["new"])
 async def cmd_new(message: types.Message):
     uid = message.from_user.id
     if uid in user_game:
-        await message.reply("Ты уже в игре. /surrender чтобы выйти.")
+        await message.reply(
+            "Ты уже в игре. /surrender чтобы выйти.",
+            reply_markup=kb_menu(_user_state(uid)),
+        )
         return
     code = new_code()
     game = {
@@ -411,41 +470,49 @@ async def cmd_new(message: types.Message):
     user_game[uid] = code
     await save_game(code)
     log.info("game created code=%s host=%s", code, uid)
+    deep = f"https://t.me/{BOT_USERNAME}?start={code}"
     await message.reply(
-        f"🎲 Игра создана. Код: <code>{code}</code>\n"
-        f"Отправь его сопернику — пусть напишет <code>/join {code}</code>\n\n"
-        f"Пока можешь /replace — перекинуть расстановку.",
+        f"🎲 Игра создана.\nКод: <code>{code}</code>\n"
+        f"Ссылка: {deep}\n\n"
+        f"Жми «📨 Позвать друга» — откроется список контактов Telegram.\n"
+        f"Пока ждём соперника — можно /replace, чтобы перекинуть расстановку.",
         parse_mode="HTML",
+        reply_markup=kb_invite(code),
     )
-    await send_boards(game, uid, "Твоя расстановка:")
+    await send_boards(
+        game, uid, "Твоя расстановка:", reply_markup=kb_menu("PLACING")
+    )
 
 
-@dp.message_handler(commands=["join"])
-async def cmd_join(message: types.Message):
+async def _try_join(message: types.Message, code: str):
+    """Общая join-логика: из /join <код> и из deep-link /start <код>."""
     uid = message.from_user.id
     if uid in user_game:
-        await message.reply("Ты уже в игре. /surrender чтобы выйти.")
+        await message.reply(
+            "Ты уже в игре. /surrender чтобы выйти.",
+            reply_markup=kb_menu(_user_state(uid)),
+        )
         return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply("Формат: /join КОД")
-        return
-    code = parts[1].strip().upper()
+    code = code.strip().upper()
     if not CODE_RE.match(code):
-        await message.reply("Код должен состоять из 6 символов A–Z или 0–9.")
+        await message.reply(
+            "Код должен состоять из 6 символов A–Z или 0–9.",
+            reply_markup=kb_menu(),
+        )
         return
     if not join_allowed(uid):
         await message.reply(
-            f"Слишком много попыток. Подожди минуту (лимит {JOIN_MAX_ATTEMPTS}/мин)."
+            f"Слишком много попыток. Подожди минуту (лимит {JOIN_MAX_ATTEMPTS}/мин).",
+            reply_markup=kb_menu(),
         )
         log.warning("join rate-limit uid=%s", uid)
         return
     game = games.get(code)
     if not game:
-        await message.reply("Игра с таким кодом не найдена.")
+        await message.reply("Игра с таким кодом не найдена.", reply_markup=kb_menu())
         return
     if game["state"] != "WAITING" or len(game["players"]) >= 2:
-        await message.reply("Игра уже идёт или завершена.")
+        await message.reply("Игра уже идёт или завершена.", reply_markup=kb_menu())
         return
     game["state"] = "PLACING"  # занимаем слот до await, чтобы закрыть race-окно
     game["players"][uid] = new_player()
@@ -455,16 +522,33 @@ async def cmd_join(message: types.Message):
         log.exception("join: reroll failed")
         game["players"].pop(uid, None)
         game["state"] = "WAITING"
-        await message.reply(str(e))
+        await message.reply(str(e), reply_markup=kb_menu())
         return
     user_game[uid] = code
     await save_game(code)
     log.info("player %s joined code=%s", uid, code)
     await message.reply(
-        "✅ Присоединился. /replace — перекинуть расстановку, /ready — готов к бою."
+        "✅ Присоединился. /replace — перекинуть расстановку, /ready — готов к бою.",
+        reply_markup=kb_menu("PLACING"),
     )
     await send_boards(game, uid, "Твоя расстановка:")
-    await bot.send_message(game["host"], "🎮 Соперник подключился! Жми /ready когда готов.")
+    await bot.send_message(
+        game["host"],
+        "🎮 Соперник подключился! Жми /ready когда готов.",
+        reply_markup=kb_menu("PLACING"),
+    )
+
+
+@dp.message_handler(commands=["join"])
+async def cmd_join(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply(
+            "Формат: /join КОД",
+            reply_markup=kb_menu(_user_state(message.from_user.id)),
+        )
+        return
+    await _try_join(message, parts[1])
 
 
 @dp.message_handler(commands=["replace"])
@@ -472,23 +556,30 @@ async def cmd_replace(message: types.Message):
     uid = message.from_user.id
     code = user_game.get(uid)
     if not code:
-        await message.reply("Ты не в игре.")
+        await message.reply("Ты не в игре.", reply_markup=kb_menu())
         return
     game = games[code]
     if game["state"] not in ("WAITING", "PLACING"):
-        await message.reply("Бой уже начался, расстановку менять нельзя.")
+        await message.reply(
+            "Бой уже начался, расстановку менять нельзя.",
+            reply_markup=kb_menu(game["state"]),
+        )
         return
     p = game["players"][uid]
     if p["ready"]:
-        await message.reply("Ты уже нажал /ready.")
+        await message.reply(
+            "Ты уже нажал /ready.", reply_markup=kb_menu("PLACING")
+        )
         return
     try:
         safe_reroll(p)
     except RuntimeError as e:
-        await message.reply(str(e))
+        await message.reply(str(e), reply_markup=kb_menu("PLACING"))
         return
     await save_game(code)
-    await send_boards(game, uid, "Новая расстановка:")
+    await send_boards(
+        game, uid, "Новая расстановка:", reply_markup=kb_menu("PLACING")
+    )
 
 
 @dp.message_handler(commands=["ready"])
@@ -496,20 +587,24 @@ async def cmd_ready(message: types.Message):
     uid = message.from_user.id
     code = user_game.get(uid)
     if not code:
-        await message.reply("Ты не в игре.")
+        await message.reply("Ты не в игре.", reply_markup=kb_menu())
         return
     game = games[code]
     if game["state"] not in ("WAITING", "PLACING"):
-        await message.reply("Бой уже идёт.")
+        await message.reply("Бой уже идёт.", reply_markup=kb_menu("PLAYING"))
         return
     if len(game["players"]) < 2:
-        await message.reply("Ждём второго игрока.")
+        await message.reply(
+            "Ждём второго игрока. Позови через кнопку «Позвать друга» в сообщении с кодом.",
+            reply_markup=kb_menu("PLACING"),
+        )
         return
     if game["players"][uid]["ready"]:
-        await message.reply("Ты уже готов, ждём соперника.")
+        await message.reply(
+            "Ты уже готов, ждём соперника.", reply_markup=kb_menu("PLACING")
+        )
         return
     game["players"][uid]["ready"] = True
-    await message.reply("✔ Готов.")
     opp = other(game, uid)
     if game["players"][opp]["ready"]:
         game["state"] = "PLAYING"
@@ -518,11 +613,23 @@ async def cmd_ready(message: types.Message):
         second = other(game, first)
         await save_game(code)
         schedule_turn_timer(code)
-        await bot.send_message(first, f"🔫 Твой ход. Координата, например B7. На ход — {TURN_TIMEOUT_SEC // 60} мин.")
-        await bot.send_message(second, "⏳ Ход соперника.")
+        await message.reply("✔ Готов.", reply_markup=kb_menu("PLAYING"))
+        await bot.send_message(
+            first,
+            f"🔫 Твой ход. Координата, например B7. На ход — {TURN_TIMEOUT_SEC // 60} мин.",
+            reply_markup=kb_menu("PLAYING"),
+        )
+        await bot.send_message(
+            second, "⏳ Ход соперника.", reply_markup=kb_menu("PLAYING")
+        )
     else:
         await save_game(code)
-        await bot.send_message(opp, "Соперник готов. Жми /ready когда расставишь корабли.")
+        await message.reply("✔ Готов.", reply_markup=kb_menu("PLACING"))
+        await bot.send_message(
+            opp,
+            "Соперник готов. Жми /ready когда расставишь корабли.",
+            reply_markup=kb_menu("PLACING"),
+        )
 
 
 @dp.message_handler(commands=["surrender"])
@@ -530,17 +637,19 @@ async def cmd_surrender(message: types.Message):
     uid = message.from_user.id
     code = user_game.get(uid)
     if not code:
-        await message.reply("Ты не в игре.")
+        await message.reply("Ты не в игре.", reply_markup=kb_menu())
         return
     game = games[code]
     log.info("surrender uid=%s code=%s", uid, code)
     cancel_turn_timer(code)
-    await message.reply("🏳 Ты сдался.")
+    await message.reply("🏳 Ты сдался.", reply_markup=kb_menu())
     for pid in list(game["players"].keys()):
         user_game.pop(pid, None)
         if pid != uid:
             try:
-                await bot.send_message(pid, "🏆 Соперник сдался. Победа!")
+                await bot.send_message(
+                    pid, "🏆 Соперник сдался. Победа!", reply_markup=kb_menu()
+                )
             except Exception:
                 pass
     games.pop(code, None)
@@ -611,14 +720,21 @@ async def handle_move(message: types.Message):
                 opp["incoming_misses"].add(n)
 
     if all(not s["alive"] for s in opp["ships"]):
-        await send_boards(game, uid, f"💥 Убил ({coord_name})!\n🏆 ПОБЕДА!")
-        await send_boards(game, opp_id, f"Соперник убил корабль {coord_name}.\n💀 Поражение.")
         log.info("game %s finished, winner=%s", code, uid)
         cancel_turn_timer(code)
         for pid in list(game["players"].keys()):
             user_game.pop(pid, None)
         games.pop(code, None)
         await delete_game(code)
+        await send_boards(
+            game, uid, f"💥 Убил ({coord_name})!\n🏆 ПОБЕДА!",
+            reply_markup=kb_menu(),
+        )
+        await send_boards(
+            game, opp_id,
+            f"Соперник убил корабль {coord_name}.\n💀 Поражение.",
+            reply_markup=kb_menu(),
+        )
         return
 
     await save_game(code)
@@ -628,10 +744,27 @@ async def handle_move(message: types.Message):
 
 
 async def on_startup(dispatcher):
-    global db_pool
+    global db_pool, BOT_USERNAME
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     log.info("db pool created")
     await load_state()
+    try:
+        me = await bot.get_me()
+        BOT_USERNAME = me.username
+        log.info("bot @%s", BOT_USERNAME)
+    except Exception:
+        log.exception("get_me failed (deep-link invites will not work)")
+    try:
+        await bot.set_my_commands([
+            types.BotCommand("new", "Создать игру"),
+            types.BotCommand("join", "Войти по коду"),
+            types.BotCommand("replace", "Перекинуть расстановку"),
+            types.BotCommand("ready", "Готов к бою"),
+            types.BotCommand("surrender", "Сдаться"),
+            types.BotCommand("help", "Помощь"),
+        ])
+    except Exception:
+        log.exception("set_my_commands failed (non-fatal)")
     if STARTUP_DELAY_SEC > 0:
         log.info("startup delay %ss to release previous getUpdates session", STARTUP_DELAY_SEC)
         await asyncio.sleep(STARTUP_DELAY_SEC)
