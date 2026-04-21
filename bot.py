@@ -470,17 +470,18 @@ async def cmd_new(message: types.Message):
     user_game[uid] = code
     await save_game(code)
     log.info("game created code=%s host=%s", code, uid)
+    await send_boards(
+        game, uid, f"🎲 Игра создана. Код: <code>{code}</code>\nТвоя расстановка:",
+        reply_markup=kb_menu("PLACING"),
+    )
     deep = f"https://t.me/{BOT_USERNAME}?start={code}"
-    await message.reply(
-        f"🎲 Игра создана.\nКод: <code>{code}</code>\n"
-        f"Ссылка: {deep}\n\n"
-        f"Жми «📨 Позвать друга» — откроется список контактов Telegram.\n"
-        f"Пока ждём соперника — можно /replace, чтобы перекинуть расстановку.",
+    await bot.send_message(
+        uid,
+        f"Позови соперника — кнопка ниже откроет список контактов Telegram.\n"
+        f"Ссылка для ручной отправки: {deep}",
         parse_mode="HTML",
         reply_markup=kb_invite(code),
-    )
-    await send_boards(
-        game, uid, "Твоя расстановка:", reply_markup=kb_menu("PLACING")
+        disable_web_page_preview=True,
     )
 
 
