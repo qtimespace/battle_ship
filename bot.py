@@ -1,8 +1,17 @@
 import os
 import random
 import string
+from io import BytesIO
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
+from aiogram.types import InputFile
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
 
 API_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
@@ -131,6 +140,99 @@ def render(player, show_ships):
     return "<pre>" + "\n".join(rows) + "</pre>"
 
 
+def _draw_dashed_line(draw, start, end, color, dash=6, gap=5, width=2):
+    x1, y1 = start
+    x2, y2 = end
+    if x1 == x2:
+        y = min(y1, y2)
+        y_end = max(y1, y2)
+        while y < y_end:
+            y2s = min(y + dash, y_end)
+            draw.line([(x1, y), (x2, y2s)], fill=color, width=width)
+            y += dash + gap
+    elif y1 == y2:
+        x = min(x1, x2)
+        x_end = max(x1, x2)
+        while x < x_end:
+            x2s = min(x + dash, x_end)
+            draw.line([(x, y1), (x2s, y2)], fill=color, width=width)
+            x += dash + gap
+
+
+def render_board_image(player, show_ships):
+    """Render board as image close to reference style."""
+    if Image is None:
+        return None
+
+    cell = 56
+    left = 70
+    top = 70
+    size = FIELD * cell
+    width = left + size + 24
+    height = top + size + 24
+
+    bg = (22, 69, 116)
+    grid = (102, 204, 255)
+    text_color = (102, 204, 255)
+    ship_color = (150, 225, 255)
+    hit_color = (255, 120, 80)
+    miss_color = (255, 80, 80)
+    unknown_color = (190, 225, 240)
+
+    img = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default()
+
+    # Letters and numbers
+    for i, letter in enumerate(LETTERS):
+        x = left + i * cell + cell // 2 - 4
+        draw.text((x, 22), letter, fill=text_color, font=font)
+    for i in range(FIELD):
+        y = top + i * cell + cell // 2 - 6
+        draw.text((22, y), str(i + 1), fill=text_color, font=font)
+
+    # Dashed grid
+    for i in range(FIELD + 1):
+        x = left + i * cell
+        _draw_dashed_line(draw, (x, top), (x, top + size), grid)
+    for i in range(FIELD + 1):
+        y = top + i * cell
+        _draw_dashed_line(draw, (left, y), (left + size, y), grid)
+
+    # Marks
+    for y in range(FIELD):
+        for x in range(FIELD):
+            cell_xy = (x, y)
+            cx = left + x * cell + cell // 2
+            cy = top + y * cell + cell // 2
+
+            if show_ships:
+                in_ship = any(cell_xy in s for s in player["ships_cells"])
+                hit = cell_xy in player["incoming_hits"]
+                miss = cell_xy in player["incoming_misses"]
+                if hit:
+                    draw.text((cx - 6, cy - 6), "*", fill=hit_color, font=font)
+                elif miss:
+                    draw.ellipse((cx - 4, cy - 4, cx + 4, cy + 4), fill=miss_color)
+                elif in_ship:
+                    draw.rectangle((cx - 7, cy - 7, cx + 7, cy + 7), outline=ship_color, width=2)
+                else:
+                    draw.rectangle((cx - 3, cy - 3, cx + 3, cy + 3), fill=unknown_color)
+            else:
+                if cell_xy in player["shots_hit"]:
+                    draw.text((cx - 6, cy - 6), "*", fill=hit_color, font=font)
+                elif cell_xy in player["shots_miss"]:
+                    draw.ellipse((cx - 4, cy - 4, cx + 4, cy + 4), fill=miss_color)
+                else:
+                    draw.rectangle((cx - 3, cy - 3, cx + 3, cy + 3), fill=unknown_color)
+
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    buf.name = "board.png"
+    return buf
+
+
 def new_player():
     return {
         "ready": False,
@@ -151,6 +253,17 @@ def reroll(player):
 
 async def send_boards(game, user_id, prefix=""):
     p = game["players"][user_id]
+    own_img = render_board_image(p, show_ships=True)
+    enemy_img = render_board_image(p, show_ships=False)
+    if own_img and enemy_img:
+        await bot.send_message(
+            user_id,
+            f"✨ {prefix}\nℹ️ Обозначения: квадрат = корабль, * = попадание, красная точка = промах",
+        )
+        await bot.send_photo(user_id, InputFile(enemy_img), caption="🎯 Поле противника (твои выстрелы)")
+        await bot.send_photo(user_id, InputFile(own_img), caption="🛡️ Твоё поле")
+        return
+
     own = render(p, show_ships=True)
     enemy = render(p, show_ships=False)
     text = (

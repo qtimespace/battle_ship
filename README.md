@@ -62,10 +62,11 @@
 
 ## Запуск
 
-Требуется Python 3.8+ и `aiogram 2.x`.
+Требуется Python 3.8+, `aiogram 2.x` и `Pillow`.
 
 ```bash
 pip install aiogram==2.25.2
+pip install pillow
 ```
 
 1. Открыть [bot.py](bot.py) и подставить свой токен в `API_TOKEN` (получить у [@BotFather](https://t.me/BotFather)).
