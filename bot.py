@@ -15,7 +15,7 @@ FLEET = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1]
 CELL_UNKNOWN = "."
 CELL_SHIP = "#"
 CELL_HIT = "*"
-CELL_MISS = "●"
+CELL_MISS = "O"
 
 # code -> game dict
 games = {}
@@ -156,8 +156,8 @@ async def send_boards(game, user_id, prefix=""):
     text = (
         f"✨ {prefix}\n"
         f"🎯 Поле противника (твои выстрелы):\n{enemy}\n"
-        f"🚢 Твоё поле:\n{own}\n"
-        f"ℹ️ Обозначения: # корабль, * попадание 🔥, ● промах 🔴, . неизвестно"
+        f"🛡️ Твоё поле:\n{own}\n"
+        f"ℹ️ Обозначения: # корабль, * попадание 🔥, O промах 🔴, . неизвестно"
     )
     await bot.send_message(user_id, text, parse_mode="HTML")
 
@@ -184,7 +184,7 @@ async def cmd_start(message: types.Message):
 async def cmd_new(message: types.Message):
     uid = message.from_user.id
     if uid in user_game:
-        await message.reply("Ты уже в игре. /surrender чтобы выйти.")
+        await message.reply("⚠️ Ты уже в игре. /surrender чтобы выйти.")
         return
     code = new_code()
     game = {
@@ -215,15 +215,15 @@ async def cmd_join(message: types.Message):
         return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await message.reply("Формат: /join КОД")
+        await message.reply("ℹ️ Формат: /join КОД")
         return
     code = parts[1].strip().upper()
     game = games.get(code)
     if not game:
-        await message.reply("Игра с таким кодом не найдена.")
+        await message.reply("❌ Игра с таким кодом не найдена.")
         return
     if game["state"] != "WAITING":
-        await message.reply("Игра уже идёт или завершена.")
+        await message.reply("⏱️ Игра уже идёт или завершена.")
         return
     game["players"][uid] = new_player()
     reroll(game["players"][uid])
@@ -241,15 +241,15 @@ async def cmd_replace(message: types.Message):
     uid = message.from_user.id
     code = user_game.get(uid)
     if not code:
-        await message.reply("Ты не в игре.")
+        await message.reply("ℹ️ Ты не в игре.")
         return
     game = games[code]
     if game["state"] not in ("WAITING", "PLACING"):
-        await message.reply("Бой уже начался, расстановку менять нельзя.")
+        await message.reply("🚫 Бой уже начался, расстановку менять нельзя.")
         return
     p = game["players"][uid]
     if p["ready"]:
-        await message.reply("Ты уже нажал /ready.")
+        await message.reply("✅ Ты уже нажал /ready.")
         return
     reroll(p)
     await send_boards(game, uid, "Новая расстановка:")
@@ -260,14 +260,14 @@ async def cmd_ready(message: types.Message):
     uid = message.from_user.id
     code = user_game.get(uid)
     if not code:
-        await message.reply("Ты не в игре.")
+        await message.reply("ℹ️ Ты не в игре.")
         return
     game = games[code]
     if len(game["players"]) < 2:
-        await message.reply("Ждём второго игрока.")
+        await message.reply("👥 Ждём второго игрока.")
         return
     game["players"][uid]["ready"] = True
-    await message.reply("✔ Готов.")
+    await message.reply("✅ Готов.")
     opp = other(game, uid)
     if game["players"][opp]["ready"]:
         # start
@@ -275,10 +275,10 @@ async def cmd_ready(message: types.Message):
         game["turn"] = random.choice(list(game["players"].keys()))
         first = game["turn"]
         second = other(game, first)
-        await bot.send_message(first, "🔫 Твой ход. Координата, например B7")
-        await bot.send_message(second, "⏳ Ход соперника.")
+        await bot.send_message(first, "🔫 Твой ход! Введи координату, например B7")
+        await bot.send_message(second, "⏳ Ход соперника. Готовься!")
     else:
-        await bot.send_message(opp, "Соперник готов. Жми /ready когда расставишь корабли.")
+        await bot.send_message(opp, "📣 Соперник готов. Жми /ready, когда расставишь корабли.")
 
 
 @dp.message_handler(commands=["surrender"])
@@ -286,10 +286,10 @@ async def cmd_surrender(message: types.Message):
     uid = message.from_user.id
     code = user_game.get(uid)
     if not code:
-        await message.reply("Ты не в игре.")
+        await message.reply("ℹ️ Ты не в игре.")
         return
     game = games[code]
-    await message.reply("🏳 Ты сдался.")
+    await message.reply("🏳️ Ты сдался.")
     for pid in list(game["players"].keys()):
         user_game.pop(pid, None)
         if pid != uid:
@@ -314,11 +314,11 @@ async def handle_move(message: types.Message):
         return
     move = parse_move(message.text)
     if not move:
-        await message.reply("Формат: A1, B7, J10")
+        await message.reply("ℹ️ Формат хода: A1, B7, J10")
         return
     shooter = game["players"][uid]
     if move in shooter["shots_hit"] or move in shooter["shots_miss"]:
-        await message.reply("Ты уже стрелял сюда.")
+        await message.reply("⚠️ Ты уже стрелял сюда.")
         return
 
     opp_id = other(game, uid)
@@ -336,8 +336,8 @@ async def handle_move(message: types.Message):
         shooter["shots_miss"].add(move)
         opp["incoming_misses"].add(move)
         game["turn"] = opp_id
-        await send_boards(game, uid, f"🌊 Мимо ({coord_name}). Ход соперника.")
-        await send_boards(game, opp_id, f"Соперник стрелял {coord_name} — мимо. Твой ход.")
+        await send_boards(game, uid, f"🔴 Мимо ({coord_name}). Ход соперника.")
+        await send_boards(game, opp_id, f"🛡️ Соперник стрелял {coord_name} — мимо. Твой ход!")
         return
 
     hit_ship["alive"].remove(move)
@@ -345,8 +345,8 @@ async def handle_move(message: types.Message):
     opp["incoming_hits"].add(move)
 
     if hit_ship["alive"]:
-        await send_boards(game, uid, f"🎯 Ранил ({coord_name})! Стреляй ещё.")
-        await send_boards(game, opp_id, f"Соперник ранил ({coord_name}). Ждём его хода.")
+        await send_boards(game, uid, f"🔥 Попадание ({coord_name})! Стреляй ещё.")
+        await send_boards(game, opp_id, f"💥 Соперник попал ({coord_name}). Ждём его хода.")
         return
 
     # killed: auto-mark border as misses
@@ -357,15 +357,15 @@ async def handle_move(message: types.Message):
                 opp["incoming_misses"].add(n)
 
     if all(not s["alive"] for s in opp["ships"]):
-        await send_boards(game, uid, f"💥 Убил ({coord_name})!\n🏆 ПОБЕДА!")
-        await send_boards(game, opp_id, f"Соперник убил {coord_name}.\n💀 Поражение.")
+        await send_boards(game, uid, f"💥 Корабль уничтожен ({coord_name})!\n🏆 ПОБЕДА!")
+        await send_boards(game, opp_id, f"☠️ Соперник уничтожил {coord_name}.\n💀 Поражение.")
         for pid in list(game["players"].keys()):
             user_game.pop(pid, None)
         games.pop(code, None)
         return
 
-    await send_boards(game, uid, f"💥 Убил ({coord_name})! Стреляй ещё.")
-    await send_boards(game, opp_id, f"Соперник убил корабль ({coord_name}). Ждём его хода.")
+    await send_boards(game, uid, f"💥 Корабль уничтожен ({coord_name})! Стреляй ещё.")
+    await send_boards(game, opp_id, f"🚨 Соперник уничтожил корабль ({coord_name}). Ждём его хода.")
 
 
 if __name__ == "__main__":
